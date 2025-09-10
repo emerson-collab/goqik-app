@@ -1,12 +1,11 @@
-// server.js
-const express = require('express');
-const app = express();
+const http = require('http');
 const PORT = process.env.PORT || 8080;
 
-app.get('/', (req, res) => {
-  res.send('Hello GoQik! 🚀');
+const server = http.createServer((req, res) => {
+  res.writeHead(200, { 'Content-Type': 'text/plain' });
+  res.end('Hello from GoQik app!\n');
 });
 
-app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
+server.listen(PORT, () => {
+  console.log(`Server running at http://0.0.0.0:${PORT}/`);
 });
