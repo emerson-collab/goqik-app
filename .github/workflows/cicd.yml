@@ -1,0 +1,24 @@
+name: CI/CD - Build & Push Docker
+on:
+  push:
+    branches: ["main"]     # 推送到 main 分支时自动运行
+  workflow_dispatch: {}     # 也允许手动触发
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_wzbroom }}
+          password: ${{ secrets.DOCKERHUB_dckr_pat_A-I2h15q9C38LVjKismgL1E8lfo }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            wzbroom/goqik-app:latest
+            wzbroom/goqik-app:${{ github.sha }}
