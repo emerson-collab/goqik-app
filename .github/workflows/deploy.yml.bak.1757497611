@@ -1,0 +1,68 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [ "main" ]
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build & push image
+        uses: docker/build-push-action@v6
+        with:
+          push: true
+          tags: ${{ secrets.DOCKERHUB_USERNAME }}/goqik-app:latest
+
+      - name: SSH deploy
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          port: ${{ secrets.DEPLOY_SSH_PORT }}
+          script: |
+            set -e
+            echo "[deploy] pulling image..."
+            docker pull ${{ secrets.DOCKERHUB_USERNAME }}/goqik-app:latest
+
+            echo "[deploy] stop & remove old container (if any)..."
+            docker stop goqik-app 2>/dev/null || true
+            docker rm   goqik-app 2>/dev/null || true
+
+            echo "[deploy] start new container..."
+            docker run -d --restart always --name goqik-app -p 8080:8080 \
+              -e DATABASE_URL="${{ secrets.DATABASE_URL }}" \
+              ${{ secrets.DOCKERHUB_USERNAME }}/goqik-app:latest
+
+            echo "[deploy] wait app warm up..."
+            sleep 8
+
+            # ===== 可选：如果容器里带 prisma，就自动迁移 =====
+            if docker exec goqik-app sh -lc '[ -x ./node_modules/.bin/prisma ] || [ -f ./prisma/schema.prisma ]'; then
+              echo "[deploy] prisma generate / migrate deploy..."
+              docker exec goqik-app sh -lc 'npx prisma generate || true'
+              docker exec goqik-app sh -lc 'npx prisma migrate deploy || true'
+            else
+              echo "[deploy] prisma not found, skip migrations."
+            fi
+
+            echo "[deploy] server-side health check (localhost:8080)..."
+            curl -fsS --max-time 10 http://127.0.0.1:8080/ >/dev/null
+            echo "[deploy] OK"
+
+      - name: External health check (domain)
+        run: |
+          echo "Wait remote LB/SSL settle..."
+          sleep 5
+          curl -fsS --max-time 15 https://goqik.ai/ >/dev/null && echo "✅ healthy"

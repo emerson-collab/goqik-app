@@ -1,24 +1,23 @@
 name: auto-operator (self-heal & redeploy)
 
 on:
+  workflow_dispatch:
   schedule:
-    - cron: "*/10 * * * *"   # 每10分钟自检一次
-  workflow_dispatch:        # 也支持手动触发
+    - cron: "*/10 * * * *"   # 仍保留每10分钟自愈
+
+# 防止重复叠跑
+concurrency:
+  group: goqik-auto-operator
+  cancel-in-progress: true
 
 jobs:
-  deploy:
+  run:
     runs-on: ubuntu-latest
-    env:
-      APP_NAME: goqik-app
-      DOMAIN: goqik.ai
-      DOCKER_IMAGE: ${{ secrets.DOCKERHUB_USERNAME }}/goqik-app:latest
-      DATABASE_URL: ${{ secrets.DATABASE_URL }}
-
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v3
 
-      - name: Login to Docker Hub
+      - name: Docker login
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
@@ -28,40 +27,55 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           push: true
-          tags: ${{ env.DOCKER_IMAGE }}
+          tags: ${{ secrets.DOCKERHUB_USERNAME }}/goqik-app:latest
 
-      - name: SSH deploy
-        uses: appleboy/ssh-action@v1.0.3
+      # 关键：在一次工作流内做“失败立刻重试”，最多3次
+      - name: SSH deploy with immediate retries (x3)
+        uses: appleboy/ssh-action@v0.1.10
         with:
-          host: ${{ secrets.DEPLOY_HOST }}
+          host:     ${{ secrets.DEPLOY_HOST }}
           username: ${{ secrets.DEPLOY_USER }}
-          key: ${{ secrets.DEPLOY_SSH_KEY }}
-          port: ${{ secrets.DEPLOY_SSH_PORT }}
+          key:      ${{ secrets.DEPLOY_SSH_KEY }}
+          port:     ${{ secrets.DEPLOY_SSH_PORT }}
           script_stop: true
           script: |
             set -euo pipefail
-            APP=${APP_NAME}
-            echo "[deploy] pull image"
-            docker pull "${DOCKER_IMAGE}"
-            echo "[deploy] stop/remove old"
-            docker stop ${APP} 2>/dev/null || true
-            docker rm   ${APP} 2>/dev/null || true
-            echo "[deploy] run new"
-            docker run -d --restart=always --name ${APP} \
-              -e DATABASE_URL="${DATABASE_URL}" \
-              -p 8080:8080 "${DOCKER_IMAGE}"
-            echo "[health] wait app..."
-            sleep 8
-            echo "[health] local 8080"
-            if ! curl -fsS --max-time 8 http://127.0.0.1:8080/ >/dev/null ; then
-              echo "local 8080 failed"; docker logs --tail 200 ${APP} || true; exit 1
-            fi
-            echo "[health] public https://${DOMAIN}"
-            if ! curl -fsS --max-time 15 "https://${DOMAIN}/" >/dev/null ; then
-              echo "public check failed (maybe cert/nginx/app cold start)"; docker logs --tail 200 ${APP} || true
-            fi
-            echo "[status]"; docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
+            echo "[deploy] start (max 3 attempts)"
+            for i in 1 2 3; do
+              echo "[deploy] attempt $i ..."
+              docker pull ${{ secrets.DOCKERHUB_USERNAME }}/goqik-app:latest
+              docker stop goqik-app 2>/dev/null || true
+              docker rm   goqik-app 2>/dev/null || true
 
-      - name: Mark success
-        if: ${{ success() }}
-        run: echo "✅ auto-operator done"
+              # 运行容器（携带数据库 URL）
+              docker run -d --restart=always --name goqik-app -p 8080:8080 \
+                -e DATABASE_URL='${{ secrets.DATABASE_URL }}' \
+                ${{ secrets.DOCKERHUB_USERNAME }}/goqik-app:latest
+
+              echo "[deploy] wait app warm-up ..."
+              sleep 8
+
+              if curl -fsS --max-time 8 http://127.0.0.1:8080/ >/dev/null; then
+                echo "[deploy] local 8080 OK"
+                break
+              fi
+
+              echo "[deploy] local 8080 failed, dump last logs:"
+              docker logs --tail 200 goqik-app || true
+              if [ "$i" = "3" ]; then
+                echo "[deploy] all 3 attempts failed"; exit 1
+              fi
+              sleep 8
+            done
+
+      - name: External health check (https://goqik.ai/)
+        run: |
+          set -e
+          for i in {1..10}; do
+            if curl -fsS --max-time 10 https://goqik.ai/ >/dev/null; then
+              echo "[health] public OK"; exit 0
+            fi
+            echo "[health] public not ready ($i/10), wait..."
+            sleep 6
+          done
+          echo "[health] public check failed"; exit 1
