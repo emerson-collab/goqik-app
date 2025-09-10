@@ -1,4 +1,6 @@
 name: CI/CD Pipeline
+permissions:
+  contents: write
 
 on:
   workflow_dispatch:
@@ -42,7 +44,7 @@ jobs:
             docker rm   goqik-app 2>/dev/null || true
 
             echo "[deploy] start new container..."
-            docker run -d --restart always --name goqik-app -p 8080:8080 \
+            docker run -d --restart always --name goqik-app -p 8080:8080  -e DATABASE_URL=${{ secrets.DATABASE_URL }} \\
               -e DATABASE_URL="${{ secrets.DATABASE_URL }}" \
               ${{ secrets.DOCKERHUB_USERNAME }}/goqik-app:latest
 
