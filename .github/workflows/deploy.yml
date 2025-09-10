@@ -1,26 +1,21 @@
-name: CI/CD Pipeline (Docker -> Server)
+name: CI/CD Pipeline
 
 on:
   push:
     branches: [ "main" ]
-  workflow_dispatch:
 
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - name: Checkout code
+        uses: actions/checkout@v3
 
-      - name: Login to Docker Hub
-        uses: docker/login-action@v3
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v2
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      - name: Setup Buildx
-        uses: docker/setup-buildx-action@v3
 
       - name: Build & Push image
         uses: docker/build-push-action@v6
@@ -28,20 +23,31 @@ jobs:
           context: .
           push: true
           tags: ${{ secrets.DOCKERHUB_USERNAME }}/goqik-app:latest
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
 
       - name: Deploy to server via SSH
-        uses: appleboy/ssh-action@v1.0.3
+        uses: appleboy/ssh-action@v1.0.0
         with:
-          host: ${{ secrets.DEPLOY_HOST }}
+          host:     ${{ secrets.DEPLOY_HOST }}
           username: ${{ secrets.DEPLOY_USER }}
-          key: ${{ secrets.DEPLOY_SSH_KEY }}
-          port: ${{ secrets.DEPLOY_SSH_PORT }}
+          key:      ${{ secrets.DEPLOY_SSH_KEY }}
+          port:     ${{ secrets.DEPLOY_SSH_PORT }}
           script_stop: true
           script: |
             set -e
+            echo "Pull latest image..."
             docker pull ${{ secrets.DOCKERHUB_USERNAME }}/goqik-app:latest
-            docker stop goqik-app || true
-            docker rm goqik-app || true
-            docker run -d --restart=always --name goqik-app -p 8080:8080 ${{ secrets.DOCKERHUB_USERNAME }}/goqik-app:latest
+            echo "Stop & remove old container (ignore if not exists)..."
+            docker stop goqik-app  || true
+            docker rm   goqik-app  || true
+            echo "Run new container..."
+            docker run -d --restart=always --name goqik-app -p 8080:8080 \
+              ${{ secrets.DOCKERHUB_USERNAME }}/goqik-app:latest
+            echo "Container started."
+
+      - name: Health check after deploy
+        run: |
+          echo "⏳ Wait app to warm up..."
+          sleep 8
+          echo "➡️  Check https://goqik.ai/"
+          curl -fsSL --max-time 15 https://goqik.ai/ >/dev/null
+          echo "✅ Health check passed."
