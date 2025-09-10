@@ -2,32 +2,22 @@ name: CI/CD - Build & Push Docker
 
 on:
   push:
-    branches: ["main"]   # 每次推送 main 分支时触发
-  workflow_dispatch: {}   # 也可以手动在 GitHub Actions 里点运行
+    branches:
+      - main
 
 jobs:
-  build-and-push:
+  build:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - name: Checkout code
+        uses: actions/checkout@v3
 
-      - name: Setup Buildx
-        uses: docker/setup-buildx-action@v3
+      - name: Log in to Docker Hub
+        run: echo "${{ secrets.DOCKERHUB_TOKEN }}" | docker login -u "${{ secrets.DOCKERHUB_USERNAME }}" --password-stdin
 
-      - name: Login to Docker Hub
-        uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Build Docker image
+        run: docker build -t ${{ secrets.DOCKERHUB_USERNAME }}/goqik-app:latest .
 
-      - name: Build & Push
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: ./Dockerfile
-          push: true
-          tags: |
-            wzbroom/goqik-app:latest
-            wzbroom/goqik-app:${{ github.sha }}
+      - name: Push Docker image
+        run: docker push ${{ secrets.DOCKERHUB_USERNAME }}/goqik-app:latest
