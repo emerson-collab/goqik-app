@@ -1,0 +1,68 @@
+name: Deploy GoQik bundle
+
+on:
+  push:
+    branches: [ main, master ]
+    paths:
+      - "deploy/*.zip"
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Find uploaded zip
+        id: find
+        run: |
+          set -e
+          f=$(ls -t deploy/*.zip | head -n1)
+          echo "file=$f" >> $GITHUB_OUTPUT
+          echo "Found bundle: $f"
+
+      - name: Upload bundle to server
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_KEY }}
+          port: ${{ secrets.SSH_PORT || 22 }}
+          source: ${{ steps.find.outputs.file }}
+          target: ${{ secrets.INCOMING_DIR || '/opt/goqik/incoming' }}
+
+      - name: Remote deploy
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_KEY }}
+          port: ${{ secrets.SSH_PORT || 22 }}
+          script: |
+            set -e
+            INCOMING_DIR=${{ secrets.INCOMING_DIR || '/opt/goqik/incoming' }}
+            RELEASES_DIR=${{ secrets.RELEASES_DIR || '/opt/goqik/releases' }}
+            CURRENT_LINK=${{ secrets.CURRENT_LINK || '/opt/goqik/current' }}
+            TARGET_DIR=${{ secrets.TARGET_DIR || '/var/www/goqik' }}
+
+            echo "📦 Preparing deploy directories..."
+            mkdir -p "$INCOMING_DIR" "$RELEASES_DIR" "$TARGET_DIR"
+
+            echo "🔎 Picking latest uploaded file..."
+            FILE="$(ls -t "$INCOMING_DIR"/*.zip | head -n1)"
+            [ -f "$FILE" ]
+
+            TS=$(date +%Y%m%d%H%M%S)
+            DEST="$RELEASES_DIR/$TS"
+
+            echo "📂 Unzipping $FILE to $DEST ..."
+            mkdir -p "$DEST"
+            unzip -o "$FILE" -d "$DEST" >/dev/null
+
+            echo "🔗 Switching current symlink..."
+            ln -sfn "$DEST" "$CURRENT_LINK"
+
+            echo "📡 Syncing to web root..."
+            rsync -a --delete "$CURRENT_LINK"/ "$TARGET_DIR"/
+
+            echo "✅ Deploy finished: $FILE → $DEST"
