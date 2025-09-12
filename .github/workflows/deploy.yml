@@ -1,56 +1,99 @@
-name: CI/CD Pipeline
-permissions:
-  contents: write
+name: Deploy GoQik (SSOT via Secrets)
 
 on:
-  workflow_dispatch:
   push:
-    branches: [ "main" ]
+    branches: [ main ]
+  workflow_dispatch:
+
+env:
+  APP_DIR: /root/goqik
+  PORT: 8080
+  NODE_VERSION: 18
 
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v3
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - name: Log in to Docker Hub
-        uses: docker/login-action@v2
+      - name: Setup Node
+        uses: actions/setup-node@v4
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
 
-      - name: Build & push image
-        uses: docker/build-push-action@v6
+      - name: Install & Build (optional)
+        run: |
+          npm ci
+          npm run build || true
+
+      # 上传代码到服务器（不需要服务器拉私库）
+      - name: Upload workspace to server
+        uses: appleboy/scp-action@v0.1.7
         with:
-          push: true
-          tags: ${{ secrets.DOCKERHUB_USERNAME }}/goqik-app:latest
+          host: ${{ secrets.SERVER_IP }}
+          username: root
+          key: ${{ secrets.SERVER_SSH_KEY }}
+          port: 22
+          source: .
+          target: ${{ env.APP_DIR }}
+          rm: true
+          overwrite: true
+          strip_components: 0
+          timeout: 180s
 
-      - name: SSH deploy
+      # 远程执行：写 .env（来自 Secrets），安装依赖，PM2 重启并健康检查
+      - name: Remote deploy & health check
         uses: appleboy/ssh-action@v1.0.3
         with:
-          host: ${{ secrets.DEPLOY_HOST }}
-          username: ${{ secrets.DEPLOY_USER }}
-          key: ${{ secrets.DEPLOY_SSH_KEY }}
-          port: ${{ secrets.DEPLOY_SSH_PORT }}
+          host: ${{ secrets.SERVER_IP }}
+          username: root
+          key: ${{ secrets.SERVER_SSH_KEY }}
+          port: 22
           script: |
-            set -e
-            echo "[deploy] pulling image..."
-            docker pull ${{ secrets.DOCKERHUB_USERNAME }}/goqik-app:latest
+            set -euo pipefail
+            APPDIR="${APP_DIR}"
+            cd "$APPDIR"
 
-            echo "[deploy] stop & remove old container..."
-            docker stop goqik-app 2>/dev/null || true
-            docker rm goqik-app 2>/dev/null || true
+            # 确保 pm2 可用（不写死版本）
+            if ! command -v pm2 >/dev/null 2>&1; then
+              npm i -g pm2
+            fi
 
-            echo "[deploy] start new container..."
-            docker run -d --restart always --name goqik-app \
-              -p 3000:3000 \
-              -e DATABASE_URL="postgresql://postgres.weceveojlzykpjbfblsh:[@Wangzb805903]@aws-1-us-east-2.pooler.supabase.com:6543/postgres" \
-              ${{ secrets.DOCKERHUB_USERNAME }}/goqik-app:latest
+            # 只装生产依赖（无 dev）
+            if [ ! -d node_modules ]; then
+              npm ci --omit=dev || npm i --omit=dev
+            fi
 
-            echo "[deploy] wait app warm up..."
-            sleep 8
+            # 从 Secrets 写入 .env（唯一真源：DATABASE_URL）
+            cat > "$APPDIR/.env" <<ENV
+PORT=${PORT}
+NODE_ENV=production
+DATABASE_URL=${{ secrets.DATABASE_URL }}
+ENV
+            chmod 600 "$APPDIR/.env"
 
-            echo "[deploy] server-side health check..."
-            docker ps -a
+            # 启动/重启应用（不用在 repo 里写死机密）
+            if [ -f ecosystem.config.js ] || compgen -G "ecosystem.config.*" > /dev/null; then
+              pm2 start ecosystem.config.* --only goqik 2>/dev/null || true
+              pm2 restart goqik --update-env || true
+            elif [ -f src/index.js ]; then
+              pm2 describe goqik >/dev/null 2>&1 \
+                && pm2 restart goqik --update-env \
+                || pm2 start src/index.js --name goqik --update-env
+            else
+              echo "[!] src/index.js 或 ecosystem.config.* 未找到"; exit 2
+            fi
+
+            pm2 save || true
+
+            # 健康检查
+            for i in {1..30}; do
+              curl -fsS "http://127.0.0.1:${PORT}/readyz" && echo "READY" && exit 0 || sleep 2
+            done
+
+            echo "[!] Backend not ready; recent logs:"
+            pm2 logs --lines 150 goqik
+            exit 1
