@@ -1,0 +1,10 @@
+name: Deploy GoQik (SSOT via Secrets)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "deploy workflow alive ✅"
