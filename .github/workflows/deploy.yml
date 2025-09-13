@@ -22,26 +22,23 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: ${{ env.NODE_VERSION }}
-          # 不强制缓存，避免无 lock 文件时报错
 
       - name: Install & Build (optional)
         run: |
           if [ -f package-lock.json ]; then
-            echo "[i] use npm ci (lock file exists)"
-            npm ci
+            echo "[i] use npm ci (lock file exists)"; npm ci
           else
-            echo "[i] lock file not found, fallback to npm install"
-            npm install
+            echo "[i] lock file not found, fallback to npm install"; npm install
           fi
           npm run build || true
 
       - name: Upload workspace to server
         uses: appleboy/scp-action@v0.1.7
         with:
-          host: ${{ secrets.SERVER_IP }}
-          username: root
-          key: ${{ secrets.SERVER_SSH_KEY }}
-          port: 22
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          port: ${{ secrets.DEPLOY_SSH_PORT }}
           source: .
           target: ${{ env.APP_DIR }}
           rm: true
@@ -52,16 +49,17 @@ jobs:
       - name: Remote deploy & health check
         uses: appleboy/ssh-action@v1.0.3
         with:
-          host: ${{ secrets.SERVER_IP }}
-          username: root
-          key: ${{ secrets.SERVER_SSH_KEY }}
-          port: 22
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          port: ${{ secrets.DEPLOY_SSH_PORT }}
           script: |
             set -euo pipefail
             APPDIR="${APP_DIR}"
+            PORT="${PORT}"
             cd "$APPDIR"
 
-            # ---- Ensure Node & pm2 on server ----
+            # Ensure Node & pm2
             if ! command -v node >/dev/null 2>&1; then
               curl -fsSL https://deb.nodesource.com/setup_${NODE_VERSION}.x | bash - && apt-get install -y nodejs
             fi
@@ -69,24 +67,20 @@ jobs:
               npm i -g pm2
             fi
 
-            # ---- Install prod deps (server side) ----
+            # Install prod deps (server side)
             if [ ! -d node_modules ]; then
               npm ci --omit=dev || npm i --omit=dev
             fi
 
-            # ---- Write .env from Secrets (SSOT) ----
+            # Write .env from Secrets (SSOT)
             {
               echo "PORT=${PORT}"
               echo "NODE_ENV=production"
               echo "DATABASE_URL=${{ secrets.DATABASE_URL }}"
-              if [ -n "${{ secrets.ADMIN_TOKEN || '' }}" ]; then
-                echo "ADMIN_TOKEN=${{ secrets.ADMIN_TOKEN }}"
-              fi
             } > "$APPDIR/.env"
             chmod 600 "$APPDIR/.env"
 
-            # ---- Start/Restart app (multi-entry fallback) ----
-            # 优先顺序：ecosystem.* -> server.js -> src/index.js -> npm start
+            # Start/Restart: ecosystem -> server.js -> src/index.js -> npm start
             start_ok=0
             if compgen -G "ecosystem.config.*" > /dev/null; then
               pm2 start ecosystem.config.* --only goqik 2>/dev/null || true
@@ -108,14 +102,12 @@ jobs:
                 || PORT=${PORT} pm2 start "npm" --name goqik -- start
               start_ok=1
             fi
-
             if [ "$start_ok" -ne 1 ]; then
-              echo "[!] 未找到入口文件（ecosystem.* / server.js / src/index.js / npm start）"; exit 2
+              echo "[!] 未找到入口（ecosystem.* / server.js / src/index.js / npm start）"; exit 2
             fi
-
             pm2 save || true
 
-            # ---- Health check: /readyz -> / ----
+            # Health check: /readyz 或首页 /
             for i in {1..30}; do
               if curl -fsS "http://127.0.0.1:${PORT}/readyz" >/dev/null \
                  || curl -fsS -o /dev/null -I "http://127.0.0.1:${PORT}/"; then
@@ -137,20 +129,18 @@ jobs:
       PORT: 8080
       NODE_VERSION: 18
     steps:
-      - name: Roll back to placeholder (keep site up)
+      - name: Roll back to placeholder
         uses: appleboy/ssh-action@v1.0.3
         with:
-          host: ${{ secrets.SERVER_IP }}
-          username: root
-          key: ${{ secrets.SERVER_SSH_KEY }}
-          port: 22
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          port: ${{ secrets.DEPLOY_SSH_PORT }}
           script: |
             set -euo pipefail
             APPDIR="${APP_DIR}"
-            mkdir -p "$APPDIR"
-            cd "$APPDIR"
+            mkdir -p "$APPDIR"; cd "$APPDIR"
 
-            # Ensure Node & pm2 for placeholder too
             if ! command -v node >/dev/null 2>&1; then
               curl -fsSL https://deb.nodesource.com/setup_${NODE_VERSION}.x | bash - && apt-get install -y nodejs
             fi
@@ -176,4 +166,4 @@ jobs:
             for i in {1..20}; do
               curl -fsS "http://127.0.0.1:${PORT}/readyz" && echo "PLACEHOLDER READY" && exit 0 || sleep 2
             done
-            echo "[!] placeholder failed to start"; pm2 logs --lines 120 goqik; exit 1
+            echo "[!] placeholder failed"; pm2 logs --lines 120 goqik; exit 1
