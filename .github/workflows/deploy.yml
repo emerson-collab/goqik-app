@@ -46,7 +46,7 @@ jobs:
           strip_components: 0
           timeout: 180s
 
-      - name: Remote deploy & health check
+      - name: Remote deploy & health check (no hardcoded DB)
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.DEPLOY_HOST }}
@@ -57,9 +57,10 @@ jobs:
             set -euo pipefail
             APPDIR="${APP_DIR}"
             PORT="${PORT}"
-            cd "$APPDIR"
+            SECDIR="/root/.secrets"
+            ENVFILE="$APPDIR/.env"
 
-            # Ensure Node & pm2
+            # Ensure Node & PM2
             if ! command -v node >/dev/null 2>&1; then
               curl -fsSL https://deb.nodesource.com/setup_${NODE_VERSION}.x | bash - && apt-get install -y nodejs
             fi
@@ -67,47 +68,61 @@ jobs:
               npm i -g pm2
             fi
 
-            # Install prod deps (server side)
-            if [ ! -d node_modules ]; then
-              npm ci --omit=dev || npm i --omit=dev
+            # --- Resolve DATABASE_URL (Priority: GH Secret -> /root/.secrets -> existing .env) ---
+            DB_URL="${{ secrets.DATABASE_URL }}"
+            if [ -z "$DB_URL" ] && [ -f "$SECDIR/DATABASE_URL" ]; then
+              DB_URL="$(sed -n '1p' "$SECDIR/DATABASE_URL" | tr -d '\r')"
+            fi
+            if [ -z "$DB_URL" ] && [ -f "$ENVFILE" ]; then
+              DB_URL="$(grep -E '^DATABASE_URL=' "$ENVFILE" | sed 's/^DATABASE_URL=//' | tr -d '\r')"
+            fi
+            if [ -z "$DB_URL" ]; then
+              echo '[!] DATABASE_URL 未提供。请在 GitHub Secrets 或 /root/.secrets/DATABASE_URL 配置。'; exit 2
             fi
 
-            # Write .env from Secrets (SSOT)
-            {
-              echo "PORT=${PORT}"
-              echo "NODE_ENV=production"
-              echo "DATABASE_URL=${{ secrets.DATABASE_URL }}"
-            } > "$APPDIR/.env"
-            chmod 600 "$APPDIR/.env"
+            # --- Write/merge .env (no hardcode) ---
+            mkdir -p "$APPDIR"; touch "$ENVFILE"; sed -i 's/\r$//' "$ENVFILE" || true
+            PORT_LINE="PORT=${PORT}"
+            HOST_LINE="HOST=0.0.0.0"
+            NODE_ENV_LINE="NODE_ENV=production"
 
-            # Start/Restart: ecosystem -> server.js -> src/index.js -> npm start
-            start_ok=0
+            grep -q '^PORT=' "$ENVFILE"      && sed -i "s#^PORT=.*#$PORT_LINE#" "$ENVFILE"      || echo "$PORT_LINE" >> "$ENVFILE"
+            grep -q '^HOST=' "$ENVFILE"      && sed -i "s#^HOST=.*#$HOST_LINE#" "$ENVFILE"      || echo "$HOST_LINE" >> "$ENVFILE"
+            grep -q '^NODE_ENV=' "$ENVFILE"  && sed -i "s#^NODE_ENV=.*#$NODE_ENV_LINE#" "$ENVFILE" || echo "$NODE_ENV_LINE" >> "$ENVFILE"
+            if grep -q '^DATABASE_URL=' "$ENVFILE"; then
+              sed -i "s#^DATABASE_URL=.*#DATABASE_URL=$DB_URL#" "$ENVFILE"
+            else
+              echo "DATABASE_URL=$DB_URL" >> "$ENVFILE"
+            fi
+            chmod 600 "$ENVFILE"
+
+            # Export .env so pm2 inherits env
+            set -a; . "$ENVFILE"; set +a
+
+            # Ensure ESM if server.js uses import
+            if [ -f "$APPDIR/package.json" ] && ! grep -q '"type"[[:space:]]*:[[:space:]]*"module"' "$APPDIR/package.json"; then
+              cp "$APPDIR/package.json" "$APPDIR/package.json.bak.$(date +%s)"
+              node -e "let fs=require('fs');let p=JSON.parse(fs.readFileSync('$APPDIR/package.json','utf8')); p.type=p.type||'module'; fs.writeFileSync('$APPDIR/package.json', JSON.stringify(p,null,2)); console.log('[fix] add type: module');"
+            fi
+
+            cd "$APPDIR"
+            # Start/Restart: ecosystem -> server.js -> dist/server.js -> npm start
+            pm2 delete goqik >/dev/null 2>&1 || true
             if compgen -G "ecosystem.config.*" > /dev/null; then
               pm2 start ecosystem.config.* --only goqik 2>/dev/null || true
               pm2 restart goqik --update-env || true
-              start_ok=1
             elif [ -f server.js ]; then
-              pm2 describe goqik >/dev/null 2>&1 \
-                && pm2 restart goqik --update-env \
-                || PORT=${PORT} pm2 start server.js --name goqik --update-env
-              start_ok=1
-            elif [ -f src/index.js ]; then
-              pm2 describe goqik >/dev/null 2>&1 \
-                && pm2 restart goqik --update-env \
-                || PORT=${PORT} pm2 start src/index.js --name goqik --update-env
-              start_ok=1
+              pm2 start server.js --name goqik --update-env
+            elif [ -f dist/server.js ]; then
+              pm2 start dist/server.js --name goqik --update-env
             elif npm run -s | grep -q '^  start'; then
-              pm2 describe goqik >/dev/null 2>&1 \
-                && pm2 restart goqik --update-env \
-                || PORT=${PORT} pm2 start "npm" --name goqik -- start
-              start_ok=1
-            fi
-            if [ "$start_ok" -ne 1 ]; then
-              echo "[!] 未找到入口（ecosystem.* / server.js / src/index.js / npm start）"; exit 2
+              pm2 start "npm" --name goqik -- start
+            else
+              echo "[!] 未找到入口（ecosystem.* / server.js / dist/server.js / npm start）"; exit 3
             fi
             pm2 save || true
 
-            # Health check: /readyz 或首页 /
+            # Health check: /readyz -> /
             for i in {1..30}; do
               if curl -fsS "http://127.0.0.1:${PORT}/readyz" >/dev/null \
                  || curl -fsS -o /dev/null -I "http://127.0.0.1:${PORT}/"; then
@@ -115,8 +130,7 @@ jobs:
               fi
               sleep 2
             done
-
-            echo "[!] Backend not ready; recent logs:"
+            echo "[!] Backend not ready; pm2 logs tail ↓"
             pm2 logs --lines 150 goqik
             exit 1
 
@@ -140,14 +154,12 @@ jobs:
             set -euo pipefail
             APPDIR="${APP_DIR}"
             mkdir -p "$APPDIR"; cd "$APPDIR"
-
             if ! command -v node >/dev/null 2>&1; then
               curl -fsSL https://deb.nodesource.com/setup_${NODE_VERSION}.x | bash - && apt-get install -y nodejs
             fi
             if ! command -v pm2 >/dev/null 2>&1; then
               npm i -g pm2
             fi
-
             pm2 delete goqik >/dev/null 2>&1 || true
             PORT=${PORT} pm2 start node --name goqik -- -e '
               const http=require("http");
@@ -162,7 +174,6 @@ jobs:
               }).listen(p,"0.0.0.0",()=>console.log("placeholder listening",p));
             '
             pm2 save || true
-
             for i in {1..20}; do
               curl -fsS "http://127.0.0.1:${PORT}/readyz" && echo "PLACEHOLDER READY" && exit 0 || sleep 2
             done
